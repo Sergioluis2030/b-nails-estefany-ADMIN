@@ -9,4 +9,3 @@ Colores corregidos según spec:
 
 npm install
 npm run dev
-Login: cualquier email/pass (mock)
