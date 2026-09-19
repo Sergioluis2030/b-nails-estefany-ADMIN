@@ -1,5 +1,5 @@
 
-import { useState, useEffect } from 'react'
+import { useState, useEffect, useRef } from 'react'
 import logo from './assets/logo.jpg'
 
 const formatearFecha = (iso) => {
@@ -17,13 +17,13 @@ const formatearHora = (h) => {
   const hora12 = hh % 12 === 0 ? 12 : hh % 12
   return `${hora12}:${String(mm).padStart(2,'0')} ${meridiano}`
 }
-const API_URL = import.meta.env.VITE_API_URL;
-const normalizarReserva = (r) => ({ ...r, fecha: formatearFecha(r.fecha), horario: formatearHora(r.horario), fotoPago: r.fotoPago || r.fotoPagoUrl || (r.foto_pago_path ? API_URL + r.foto_pago_path : null) })
+const API_URL = import.meta.env.VITE_API_URL || 'http://localhost:3001';
+const normalizarReserva = (r) => ({ ...r, horario24: r.horario, fecha: formatearFecha(r.fecha), horario: formatearHora(r.horario), fotoPago: r.fotoPago || r.fotoPagoUrl || (r.foto_pago_path ? API_URL + r.foto_pago_path : null) })
 const normalizarCliente = (c) => ({ ...c, ultimoServicio: c.ultimo_servicio || c.ultimoServicio, totalGastado: c.total_gastado || c.totalGastado })
 
 function Login({ onLogin }) {
-  const [email, setEmail] = useState('admin@estefanypalencia.com')
-  const [pass, setPass] = useState('admin123')
+  const [email, setEmail] = useState('')
+  const [pass, setPass] = useState('')
   const [loading, setLoading] = useState(false)
   const [error, setError] = useState('')
   const handleLogin = async (e) => {
@@ -31,7 +31,7 @@ function Login({ onLogin }) {
     setLoading(true)
     setError('')
     try {
-      const res = await fetch('http://localhost:3001/api/auth/login', {
+      const res = await fetch(`${API_URL}/api/auth/login`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ email, password: pass })
@@ -75,7 +75,7 @@ function Login({ onLogin }) {
   )
 }
 
-function Calendario({ token, completadas }) {
+function Calendario({ token, completadas, refresh, onEliminarReserva, eliminando }) {
   const [month, setMonth] = useState(() => { const n = new Date(); return new Date(n.getFullYear(), n.getMonth(), 1) })
   const [detalle, setDetalle] = useState(null)
   const [citas, setCitas] = useState([])
@@ -84,6 +84,15 @@ function Calendario({ token, completadas }) {
   const [msgCliente, setMsgCliente] = useState('')
   const [msgClienteError, setMsgClienteError] = useState(false)
   const [agregandoCliente, setAgregandoCliente] = useState(false)
+  const [cargaLocal, setCargaLocal] = useState(0)
+  const eliminarCita = async () => {
+    const id = detalle?.id
+    const nombre = detalle?.nombre
+    if (!id) return
+    await onEliminarReserva(id, nombre)
+    setDetalle(null)
+    setCargaLocal(k=>k+1)
+  }
   const agregarCliente = async () => {
     const tokenFinal = token || localStorage.getItem('token') || ''
     setAgregandoCliente(true)
@@ -126,7 +135,7 @@ function Calendario({ token, completadas }) {
     setErrorCitas('')
     const tokenFinal = token || localStorage.getItem('token') || ''
     const mesKey = `${y}-${String(m+1).padStart(2,'0')}`
-    fetch(`http://localhost:3001/api/reservas/calendario?mes=${mesKey}`, { headers: { Authorization: `Bearer ${tokenFinal}` } })
+    fetch(`${API_URL}/api/reservas/calendario?mes=${mesKey}`, { headers: { Authorization: `Bearer ${tokenFinal}` } })
       .then(async res => {
         const data = await res.json().catch(()=>null)
         if (!activo) return
@@ -137,7 +146,7 @@ function Calendario({ token, completadas }) {
       .catch(()=>{ if (activo) setErrorCitas('No se pudieron cargar las citas') })
       .finally(()=>{ if (activo) setLoadingCitas(false) })
     return () => { activo = false }
-  }, [y, m])
+  }, [y, m, refresh, cargaLocal])
   const todas = [...citas, ...completadas.filter(c => !citas.some(x => x.id === c.id))]
   const cambiaMes = (offset) => { setDetalle(null); setMonth(new Date(y, m+offset, 1)) }
 
@@ -195,6 +204,7 @@ function Calendario({ token, completadas }) {
               <div className="flex items-center gap-2 shrink-0">
                 <span className="bg-[#DCFCE7] text-[#166534] text-[10px] px-2 py-1 rounded-full font-bold tracking-wide">{detalle.estado.toUpperCase()}</span>
                 <button onClick={agregarCliente} disabled={agregandoCliente} className="bg-[#3f3322] hover:bg-[#2e2518] disabled:opacity-60 text-white text-[11px] font-bold px-3.5 py-2 rounded-xl transition">{agregandoCliente ? 'Agregando...' : 'Agregar Cliente'}</button>
+                <button onClick={eliminarCita} disabled={eliminando} className="bg-[#DC2626] hover:bg-[#B91C1C] disabled:opacity-60 text-white text-[11px] font-bold px-3.5 py-2 rounded-xl transition">{eliminando ? 'Eliminando...' : 'Eliminar Reserva'}</button>
                 <button onClick={()=>setDetalle(null)} className="w-8 h-8 rounded-full bg-[var(--bg-app)] border border-[var(--border-card)] text-[var(--text-secondary)] font-bold hover:opacity-70">✕</button>
               </div>
             </div>
@@ -238,72 +248,168 @@ function Dashboard({ token }) {
   const [paginaClientes, setPaginaClientes] = useState(1)
   const [totalPaginas, setTotalPaginas] = useState(1)
   const [totalClientes, setTotalClientes] = useState(0)
-  useEffect(() => {
+  const [refreshCalendario, setRefreshCalendario] = useState(0)
+  const [editFecha, setEditFecha] = useState('')
+  const [editHorario, setEditHorario] = useState('')
+  const [confirmando, setConfirmando] = useState(false)
+  const [eliminando, setEliminando] = useState(false)
+  const [editCliente, setEditCliente] = useState(null)
+  const [formEdit, setFormEdit] = useState({ nombre:'', telefono:'', correo:'', ultimoServicio:'', visitas:'', totalGastado:'' })
+  const [guardandoCliente, setGuardandoCliente] = useState(false)
+  const [errorEdit, setErrorEdit] = useState('')
+  useEffect(() => { if (selected) { setEditFecha(selected.fecha || ''); setEditHorario((selected.horario24 || '').slice(0,5)) } }, [selected?.id])
+  const paginaRef = useRef(paginaClientes); paginaRef.current = paginaClientes
+  const busquedaRef = useRef(busqueda); busquedaRef.current = busqueda
+  const cargarReservas = async () => {
     const tokenFinal = token || localStorage.getItem('token') || ''
-    fetch('http://localhost:3001/api/reservas', { headers: { Authorization: `Bearer ${tokenFinal}` } })
-      .then(async res => {
-        const data = await res.json().catch(()=>null)
-        if (!res.ok) { setErrorReservas('No se pudieron cargar las reservas'); return }
-        const arr = Array.isArray(data) ? data : (data?.reservas || [])
-        setReservas(arr.filter(r=>r.estado==='pendiente').map(normalizarReserva))
-      })
-      .catch(()=>setErrorReservas('No se pudieron cargar las reservas'))
-      .finally(()=>setLoadingReservas(false))
-  }, [])
-  useEffect(() => {
+    setLoadingReservas(true)
+    setErrorReservas('')
+    try {
+      const res = await fetch(`${API_URL}/api/reservas`, { headers: { Authorization: `Bearer ${tokenFinal}` } })
+      const data = await res.json().catch(()=>null)
+      if (!res.ok) { setErrorReservas('No se pudieron cargar las reservas'); return }
+      const arr = Array.isArray(data) ? data : (data?.reservas || [])
+      setReservas(arr.filter(r=>r.estado==='pendiente').map(normalizarReserva))
+    } catch (err) {
+      setErrorReservas('No se pudieron cargar las reservas')
+    } finally {
+      setLoadingReservas(false)
+    }
+  }
+  const cargarClientes = async (pag, q) => {
     const tokenFinal = token || localStorage.getItem('token') || ''
     setLoadingClientes(true)
     setErrorClientes('')
-    const url = `${API_URL}/api/clientes?page=${paginaClientes}${busqueda.trim() ? `&q=${encodeURIComponent(busqueda.trim())}` : ''}`
-    fetch(url, { headers: { Authorization: `Bearer ${tokenFinal}` } })
-      .then(async res => {
-        const data = await res.json().catch(()=>null)
-        if (!res.ok) { setErrorClientes('No se pudieron cargar los clientes'); return }
-        if (Array.isArray(data)) {
-          setClientes(data.map(normalizarCliente))
-          setTotalPaginas(1)
-          setTotalClientes(data.length)
-        } else {
-          setClientes((data?.clientes || []).map(normalizarCliente))
-          setTotalPaginas(data?.totalPaginas || 1)
-          setTotalClientes(data?.total || 0)
-        }
-      })
-      .catch(()=>setErrorClientes('No se pudieron cargar los clientes'))
-      .finally(()=>setLoadingClientes(false))
-  }, [paginaClientes, busqueda])
+    const url = `${API_URL}/api/clientes?page=${pag}${q.trim() ? `&q=${encodeURIComponent(q.trim())}` : ''}`
+    try {
+      const res = await fetch(url, { headers: { Authorization: `Bearer ${tokenFinal}` } })
+      const data = await res.json().catch(()=>null)
+      if (!res.ok) { setErrorClientes('No se pudieron cargar los clientes'); return }
+      if (Array.isArray(data)) {
+        setClientes(data.map(normalizarCliente))
+        setTotalPaginas(1)
+        setTotalClientes(data.length)
+      } else {
+        setClientes((data?.clientes || []).map(normalizarCliente))
+        setTotalPaginas(data?.totalPaginas || 1)
+        setTotalClientes(data?.total || 0)
+      }
+    } catch (err) {
+      setErrorClientes('No se pudieron cargar los clientes')
+    } finally {
+      setLoadingClientes(false)
+    }
+  }
+  useEffect(() => { cargarReservas() }, [])
+  useEffect(() => { cargarClientes(paginaClientes, busqueda) }, [paginaClientes, busqueda])
+  useEffect(() => {
+    let ws = null
+    let cerrado = false
+    let timer = null 
+    const conectar = () => {
+      const baseWS = API_URL.replace(/^http/, 'ws')
+      ws = new WebSocket(`${baseWS}/ws`)
+      ws.onmessage = (e) => {
+        try {
+          const msg = JSON.parse(e.data)
+          if (msg.type === 'reserva_actualizada') {
+            setRefreshCalendario(k=>k+1)
+            const r = msg.reserva
+            if (r?.estado === 'completada') {
+              setLeaving(prev => (prev === null ? r.id : prev))
+              setTimeout(()=>{ setReservas(prev=>prev.filter(x=>x.id!==r.id)); setSelected(prev=>prev?.id===r.id ? null : prev) }, 800)
+            } else {
+              cargarReservas()
+            }
+          }
+          if (msg.type === 'cliente_agregado' || msg.type === 'cliente_actualizado') cargarClientes(paginaRef.current, busquedaRef.current)
+        } catch (err) {}
+      }
+      ws.onclose = () => { if (!cerrado) timer = setTimeout(conectar, 3000) }
+      ws.onerror = () => { try { ws.close() } catch (err) {} }
+    }
+    conectar()
+    return () => { cerrado = true; clearTimeout(timer); try { ws.close() } catch (err) {} }
+  }, [])
   const showToast = (msg) => { setToast(msg); setTimeout(()=>setToast(''), 3000) }
+  const abrirEditarCliente = (c) => {
+    setFormEdit({ nombre: c.nombre || '', telefono: c.telefono || '', correo: c.correo || '', ultimoServicio: c.ultimoServicio || '', visitas: c.visitas ?? '', totalGastado: c.totalGastado || '' })
+    setErrorEdit('')
+    setEditCliente(c)
+  }
+  const guardarEditCliente = async () => {
+    const tokenFinal = token || localStorage.getItem('token') || ''
+    const { nombre, telefono, correo, ultimoServicio, totalGastado } = formEdit
+    if (!nombre.trim() || !telefono.trim()) { setErrorEdit('Nombre y teléfono son requeridos'); return }
+    setGuardandoCliente(true)
+    setErrorEdit('')
+    try {
+      const res = await fetch(`${API_URL}/api/clientes/${editCliente.id}`, {
+        method: 'PATCH',
+        headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${tokenFinal}` },
+        body: JSON.stringify({ nombre: nombre.trim(), telefono: telefono.trim(), correo: correo.trim() || null, ultimo_servicio: ultimoServicio.trim() || null, total_gastado: totalGastado.trim() || 0 })
+      })
+      const data = await res.json().catch(()=>null)
+      if (!res.ok) { setErrorEdit(data?.error || 'No se pudo actualizar el cliente'); return }
+      showToast('Cliente actualizado ✓')
+      setEditCliente(null)
+      cargarClientes(paginaRef.current, busquedaRef.current)
+    } catch (err) {
+      setErrorEdit('No se pudo actualizar el cliente')
+    } finally {
+      setGuardandoCliente(false)
+    }
+  }
   const completarReserva = async (id) => {
     const reserva = reservas.find(r => r.id === id)
     const tokenFinal = token || localStorage.getItem('token') || ''
+    const fecha = editFecha
+    const horario = editHorario
+    if (!fecha || !horario) { showToast('Ingresa fecha y horario'); return }
+    setConfirmando(true)
     try {
-      const res = await fetch(`http://localhost:3001/api/reservas/${id}`, {
+      const mismaCita = reserva && reserva.fecha === fecha && ((reserva.horario24 || reserva.horario || '').slice(0,5)) === horario
+      if (!mismaCita) {
+        const resDisponible = await fetch(`${API_URL}/api/reservas/horarios/${fecha}`, { headers: { Authorization: `Bearer ${tokenFinal}` } })
+        const dataDisponible = await resDisponible.json().catch(()=>null)
+        if (resDisponible.ok && Array.isArray(dataDisponible?.ocupados)) {
+          const ocupados = dataDisponible.ocupados.map(String)
+          if (ocupados.includes(horario)) { showToast('El horario ya está ocupado, elige otro'); return }
+        }
+      }
+      const res = await fetch(`${API_URL}/api/reservas/${id}`, {
         method: 'PATCH',
         headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${tokenFinal}` },
-        body: JSON.stringify({ estado: 'completada' })
+        body: JSON.stringify({ estado: 'completada', fecha, horario })
       })
       if (!res.ok) throw new Error()
-      setReservas(prev => prev.map(r => r.id===id ? {...r, estado:'completada'} : r))
-      if (reserva && !completadas.find(c=>c.id===id)) setCompletadas(prev => [...prev, { ...reserva, estado: 'completada' }])
+      setReservas(prev => prev.map(r => r.id===id ? {...r, estado:'completada', fecha, horario: formatearHora(horario), horario24: horario} : r))
+      if (reserva && !completadas.find(c=>c.id===id)) setCompletadas(prev => [...prev, { ...reserva, estado: 'completada', fecha, horario: formatearHora(horario), horario24: horario }])
       showToast('Reserva confirmada ✓')
-      setTimeout(()=>{ setLeaving(id); setTimeout(()=>{ setReservas(prev=>prev.filter(r=>r.id!==id)); setSelected(prev=>prev?.id===id ? null : prev) }, 800) }, 2000)
+      setLeaving(id)
+      setTimeout(()=>{ setReservas(prev=>prev.filter(r=>r.id!==id)); setSelected(prev=>prev?.id===id ? null : prev) }, 800)
     } catch (err) {
       showToast('No se pudo confirmar la reserva')
+    } finally {
+      setConfirmando(false)
     }
   }
-  const eliminarReserva = async (id) => {
+  const eliminarReserva = async (id, nombre) => {
     const tokenFinal = token || localStorage.getItem('token') || ''
+    setEliminando(true)
     try {
-      const res = await fetch(`http://localhost:3001/api/reservas/${id}`, {
+      const res = await fetch(`${API_URL}/api/reservas/${id}`, {
         method: 'DELETE',
         headers: { Authorization: `Bearer ${tokenFinal}` }
       })
       if (!res.ok) throw new Error()
       setReservas(prev => prev.filter(r => r.id!==id))
       setSelected(prev => prev?.id===id ? null : prev)
-      showToast('Reserva eliminada')
+      showToast(`Reserva de ${nombre || 'cliente'} eliminada`)
     } catch (err) {
       showToast('No se pudo eliminar la reserva')
+    } finally {
+      setEliminando(false)
     }
   }
   const pendientes = reservas.filter(r=>r.estado==='pendiente').length
@@ -355,7 +461,7 @@ function Dashboard({ token }) {
               {selected && (
                 <div className="bg-[var(--bg-card)] rounded-[24px] border border-[var(--border-card)] overflow-hidden" style={{boxShadow:'var(--shadow-card)'}}>
                   <div className="p-6 md:p-8">
-                    <div className="flex flex-wrap gap-3 justify-between items-start"><div><h3 className="text-2xl font-bold text-[var(--text-primary)]">{selected.nombre}</h3><p className="text-sm text-[var(--text-secondary)] mt-1">{selected.servicio} • {selected.fecha} - {selected.horario}</p></div><div className="flex gap-2"><button onClick={()=>completarReserva(selected.id)} className="bg-[#166534] hover:bg-[#14532D] text-white text-xs font-bold px-4 py-2.5 rounded-xl transition">Confirmar Reserva</button><button onClick={()=>eliminarReserva(selected.id)} className="bg-[#DC2626] hover:bg-[#B91C1C] text-white text-xs font-bold px-4 py-2.5 rounded-xl transition">Eliminar Reserva</button></div></div>
+                    <div className="flex flex-wrap gap-3 justify-between items-start"><div><h3 className="text-2xl font-bold text-[var(--text-primary)]">{selected.nombre}</h3><p className="text-sm text-[var(--text-secondary)] mt-1">{selected.servicio} • {selected.fecha} - {selected.horario}</p></div><div className="flex gap-2"><button onClick={()=>completarReserva(selected.id)} disabled={confirmando} className="bg-[#166534] hover:bg-[#14532D] disabled:opacity-60 text-white text-xs font-bold px-4 py-2.5 rounded-xl transition">{confirmando ? 'Validando...' : 'Confirmar Reserva'}</button><button onClick={()=>eliminarReserva(selected.id, selected.nombre)} disabled={eliminando} className="bg-[#DC2626] hover:bg-[#B91C1C] disabled:opacity-60 text-white text-xs font-bold px-4 py-2.5 rounded-xl transition">{eliminando ? 'Eliminando...' : 'Eliminar Reserva'}</button></div></div>
                     <div className="grid grid-cols-1 md:grid-cols-2 gap-8 mt-8">
                       <div className="space-y-4"><h4 className="text-[10px] font-bold uppercase tracking-[0.2em] text-[var(--text-secondary)]">Datos del formulario</h4>
                         <div className="space-y-3 text-sm">
@@ -363,8 +469,8 @@ function Dashboard({ token }) {
                           <div className="flex justify-between gap-4 border-b border-[var(--border-card)] pb-2"><p className="text-[10px] font-bold uppercase tracking-wide text-[var(--text-secondary)]">Teléfono</p><p className="text-[var(--text-primary)] font-medium text-right text-sm">{selected.telefono}</p></div>
                           <div className="flex justify-between gap-4 border-b border-[var(--border-card)] pb-2"><p className="text-[10px] font-bold uppercase tracking-wide text-[var(--text-secondary)]">Correo</p><p className="text-[var(--text-primary)] font-medium text-right text-sm">{selected.correo}</p></div>
                           <div className="flex justify-between gap-4 border-b border-[var(--border-card)] pb-2"><p className="text-[10px] font-bold uppercase tracking-wide text-[var(--text-secondary)]">Servicio</p><p className="text-[var(--text-primary)] font-medium text-right text-sm">{selected.servicio}</p></div>
-                          <div className="flex justify-between gap-4 border-b border-[var(--border-card)] pb-2"><p className="text-[10px] font-bold uppercase tracking-wide text-[var(--text-secondary)]">Fecha</p><p className="text-[var(--text-primary)] font-medium text-right text-sm">{selected.fecha}</p></div>
-                          <div className="flex justify-between gap-4 border-b border-[var(--border-card)] pb-2"><p className="text-[10px] font-bold uppercase tracking-wide text-[var(--text-secondary)]">Horario</p><p className="text-[var(--text-primary)] font-medium text-right text-sm">{selected.horario}</p></div>
+                          <div className="flex justify-between gap-4 border-b border-[var(--border-card)] pb-2 items-center"><p className="text-[10px] font-bold uppercase tracking-wide text-[var(--text-secondary)]">Fecha</p><input type="date" value={editFecha} onChange={e=>setEditFecha(e.target.value)} className="text-sm text-right text-[var(--text-primary)] font-medium bg-transparent focus:outline-none focus:ring-2 focus:ring-[#b88a47] rounded-lg px-2 py-1 border border-transparent focus:border-[#D1D5DB]" /></div>
+                          <div className="flex justify-between gap-4 border-b border-[var(--border-card)] pb-2 items-center"><p className="text-[10px] font-bold uppercase tracking-wide text-[var(--text-secondary)]">Horario</p><input type="time" value={editHorario} onChange={e=>setEditHorario(e.target.value)} className="text-sm text-right text-[var(--text-primary)] font-medium bg-transparent focus:outline-none focus:ring-2 focus:ring-[#b88a47] rounded-lg px-2 py-1 border border-transparent focus:border-[#D1D5DB]" /></div>
                           <div><p className="text-[10px] font-bold uppercase tracking-wide text-[var(--text-secondary)]">Notas</p><p className="mt-1 bg-[var(--bg-app)] rounded-xl p-3 text-[var(--text-primary)] text-sm border border-[var(--border-card)]">{selected.notas}</p></div>
                         </div>
                       </div>
@@ -398,6 +504,7 @@ function Dashboard({ token }) {
                         <th className="px-5 py-3 font-bold">Último servicio</th>
                         <th className="px-5 py-3 font-bold text-center">Visitas</th>
                         <th className="px-5 py-3 font-bold text-right">Total</th>
+                        <th className="px-5 py-3 font-bold text-right">Acciones</th>
                       </tr>
                     </thead>
                     <tbody>
@@ -408,7 +515,8 @@ function Dashboard({ token }) {
                           <td className="px-5 py-3.5 text-[var(--text-secondary)]">{c.correo}</td>
                           <td className="px-5 py-3.5 text-[var(--text-secondary)]">{c.ultimoServicio}</td>
                           <td className="px-5 py-3.5 text-center"><span className="inline-block bg-[var(--bg-app)] border border-[var(--border-card)] px-2.5 py-1 rounded-full text-[10px] font-bold text-[var(--text-secondary)]">{c.visitas}</span></td>
-                          <td className="px-5 py-3.5 text-right font-semibold text-[#9c743b]">{c.totalGastado}</td>
+                          <td className="px-5 py-3.5 text-right font-semibold text-[#9c743b] whitespace-nowrap"><span className="text-[var(--text-secondary)]">S/ </span>{c.totalGastado}</td>
+                          <td className="px-5 py-3.5 text-right"><button onClick={()=>abrirEditarCliente(c)} className="text-xs font-bold px-3 py-1.5 rounded-lg border border-[#b88a47] text-[#9c743b] hover:bg-[#b88a47] hover:text-white transition">Editar</button></td>
                         </tr>
                       ))}
                     </tbody>
@@ -436,7 +544,36 @@ function Dashboard({ token }) {
             })()}
           </div>
         ) : (
-          <Calendario token={token} completadas={completadas} />
+          <Calendario token={token} completadas={completadas} refresh={refreshCalendario} onEliminarReserva={eliminarReserva} eliminando={eliminando} />
+        )}
+        {editCliente && (
+          <div className="fixed inset-0 z-40 flex items-center justify-center p-6 bg-black/40 backdrop-blur-sm" onClick={()=>!guardandoCliente && setEditCliente(null)}>
+            <div className="w-full max-w-md bg-[var(--bg-card)] rounded-2xl border border-[var(--border-card)] p-6 space-y-4" style={{boxShadow:'var(--shadow-card)'}} onClick={e=>e.stopPropagation()}>
+              <div className="flex items-center justify-between">
+                <h3 className="text-lg font-bold text-[var(--text-primary)]">Editar Cliente</h3>
+                <button onClick={()=>!guardandoCliente && setEditCliente(null)} className="text-[var(--text-secondary)] hover:text-[var(--text-primary)] text-2xl leading-none">×</button>
+              </div>
+              {errorEdit && <p className="text-xs text-[#DC2626] bg-[#FEE2E2] px-3 py-2 rounded-lg">{errorEdit}</p>}
+              {[['Nombre','nombre','text'],['Teléfono','telefono','tel'],['Correo','correo','email']].map(([label,campo,type])=>(
+                <div key={campo}>
+                  <label className="block text-[10px] font-bold uppercase tracking-wide text-[var(--text-secondary)] mb-1">{label}</label>
+                  <input type={type} value={formEdit[campo]} onChange={e=>setFormEdit(f=>({...f,[campo]:e.target.value}))} className="w-full text-sm bg-[var(--bg-app)] border border-[var(--border-card)] rounded-xl px-3 py-2.5 text-[var(--text-primary)] focus:outline-none focus:ring-2 focus:ring-[#b88a47]" />
+                </div>
+              ))}
+              <div>
+                <label className="block text-[10px] font-bold uppercase tracking-wide text-[var(--text-secondary)] mb-1">Último servicio</label>
+                <input type="text" value={formEdit.ultimoServicio} onChange={e=>setFormEdit(f=>({...f,ultimoServicio:e.target.value}))} className="w-full text-sm bg-[var(--bg-app)] border border-[var(--border-card)] rounded-xl px-3 py-2.5 text-[var(--text-primary)] focus:outline-none focus:ring-2 focus:ring-[#b88a47]" />
+              </div>
+              <div>
+                <label className="block text-[10px] font-bold uppercase tracking-wide text-[var(--text-secondary)] mb-1">Total S/.</label>
+                <input type="number" value={formEdit.totalGastado} onChange={e=>setFormEdit(f=>({...f,totalGastado:e.target.value}))} className="w-full text-sm bg-[var(--bg-app)] border border-[var(--border-card)] rounded-xl px-3 py-2.5 text-[var(--text-primary)] focus:outline-none focus:ring-2 focus:ring-[#b88a47]" />
+              </div>
+              <div className="flex gap-2 pt-1">
+                <button onClick={()=>setEditCliente(null)} disabled={guardandoCliente} className="flex-1 px-4 py-2.5 rounded-xl border border-[var(--border-card)] text-sm font-bold text-[var(--text-secondary)] hover:bg-[var(--bg-app)] disabled:opacity-50">Cancelar</button>
+                <button onClick={guardarEditCliente} disabled={guardandoCliente} className="flex-1 px-4 py-2.5 rounded-xl bg-[#166534] hover:bg-[#14532D] text-white text-sm font-bold disabled:opacity-60">{guardandoCliente ? 'Guardando...' : 'Guardar'}</button>
+              </div>
+            </div>
+          </div>
         )}
         {toast && <div className="fixed bottom-6 left-1/2 -translate-x-1/2 bg-[#2D2D2D] text-white text-sm px-5 py-3 rounded-full shadow-xl z-50">{toast}</div>}
       </main>
